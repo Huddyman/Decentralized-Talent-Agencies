@@ -15,11 +15,15 @@
 (define-constant err-invalid-rating (err u107))
 (define-constant err-booking-complete (err u108))
 (define-constant err-insufficient-funds (err u109))
+(define-constant err-portfolio-limit-exceeded (err u110))
+(define-constant err-portfolio-item-not-found (err u111))
 
 ;; data vars
 (define-data-var next-artist-id uint u1)
 (define-data-var next-booking-id uint u1)
 (define-data-var platform-fee uint u50)
+(define-data-var next-portfolio-id uint u1)
+(define-data-var max-portfolio-items uint u10)
 
 ;; data maps
 (define-map artists
@@ -72,6 +76,23 @@
   }
 )
 
+(define-map portfolio-items
+  { portfolio-id: uint }
+  {
+    artist-id: uint,
+    title: (string-ascii 128),
+    description: (string-ascii 512),
+    media-url: (string-ascii 256),
+    media-type: (string-ascii 32),
+    created-at: uint
+  }
+)
+
+(define-map artist-portfolio-count
+  { artist-id: uint }
+  { count: uint }
+)
+
 ;; public functions
 (define-public (register-artist (name (string-ascii 64)) (genre (string-ascii 32)) (rate-per-hour uint))
   (let
@@ -100,6 +121,11 @@
     (map-set artist-by-owner
       { owner: caller }
       { artist-id: artist-id }
+    )
+    
+    (map-set artist-portfolio-count
+      { artist-id: artist-id }
+      { count: u0 }
     )
     
     (var-set next-artist-id (+ artist-id u1))
@@ -297,6 +323,69 @@
   )
 )
 
+(define-public (add-portfolio-item (title (string-ascii 128)) (description (string-ascii 512)) (media-url (string-ascii 256)) (media-type (string-ascii 32)))
+  (let
+    (
+      (artist-record (unwrap! (map-get? artist-by-owner { owner: tx-sender }) err-not-found))
+      (artist-id (get artist-id artist-record))
+      (portfolio-id (var-get next-portfolio-id))
+      (current-count-data (default-to { count: u0 } (map-get? artist-portfolio-count { artist-id: artist-id })))
+      (current-count (get count current-count-data))
+    )
+    (asserts! (< current-count (var-get max-portfolio-items)) err-portfolio-limit-exceeded)
+    
+    (map-set portfolio-items
+      { portfolio-id: portfolio-id }
+      {
+        artist-id: artist-id,
+        title: title,
+        description: description,
+        media-url: media-url,
+        media-type: media-type,
+        created-at: stacks-block-height
+      }
+    )
+    
+    (map-set artist-portfolio-count
+      { artist-id: artist-id }
+      { count: (+ current-count u1) }
+    )
+    
+    (var-set next-portfolio-id (+ portfolio-id u1))
+    (ok portfolio-id)
+  )
+)
+
+(define-public (remove-portfolio-item (portfolio-id uint))
+  (let
+    (
+      (portfolio-data (unwrap! (map-get? portfolio-items { portfolio-id: portfolio-id }) err-portfolio-item-not-found))
+      (artist-record (unwrap! (map-get? artist-by-owner { owner: tx-sender }) err-not-found))
+      (artist-id (get artist-id artist-record))
+      (current-count-data (default-to { count: u0 } (map-get? artist-portfolio-count { artist-id: artist-id })))
+      (current-count (get count current-count-data))
+    )
+    (asserts! (is-eq (get artist-id portfolio-data) artist-id) err-unauthorized)
+    
+    (map-delete portfolio-items { portfolio-id: portfolio-id })
+    
+    (map-set artist-portfolio-count
+      { artist-id: artist-id }
+      { count: (if (> current-count u0) (- current-count u1) u0) }
+    )
+    (ok true)
+  )
+)
+
+(define-public (update-portfolio-limit (new-limit uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (> new-limit u0) err-invalid-amount)
+    (var-set max-portfolio-items new-limit)
+    (ok true)
+  )
+)
+
 ;; read only functions
 (define-read-only (get-artist (artist-id uint))
   (map-get? artists { artist-id: artist-id })
@@ -331,4 +420,20 @@
 
 (define-read-only (get-contract-owner)
   contract-owner
+)
+
+(define-read-only (get-portfolio-item (portfolio-id uint))
+  (map-get? portfolio-items { portfolio-id: portfolio-id })
+)
+
+(define-read-only (get-artist-portfolio-count (artist-id uint))
+  (default-to { count: u0 } (map-get? artist-portfolio-count { artist-id: artist-id }))
+)
+
+(define-read-only (get-max-portfolio-items)
+  (var-get max-portfolio-items)
+)
+
+(define-read-only (get-next-portfolio-id)
+  (var-get next-portfolio-id)
 )
