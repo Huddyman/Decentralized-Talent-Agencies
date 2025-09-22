@@ -17,6 +17,9 @@
 (define-constant err-insufficient-funds (err u109))
 (define-constant err-portfolio-limit-exceeded (err u110))
 (define-constant err-portfolio-item-not-found (err u111))
+(define-constant err-time-slot-conflict (err u112))
+(define-constant err-invalid-time-slot (err u113))
+(define-constant err-artist-not-available (err u114))
 
 ;; data vars
 (define-data-var next-artist-id uint u1)
@@ -24,6 +27,7 @@
 (define-data-var platform-fee uint u50)
 (define-data-var next-portfolio-id uint u1)
 (define-data-var max-portfolio-items uint u10)
+(define-data-var next-availability-id uint u1)
 
 ;; data maps
 (define-map artists
@@ -91,6 +95,25 @@
 (define-map artist-portfolio-count
   { artist-id: uint }
   { count: uint }
+)
+
+(define-map availability-slots
+  { availability-id: uint }
+  {
+    artist-id: uint,
+    start-time: uint,
+    end-time: uint,
+    is-available: bool,
+    created-at: uint
+  }
+)
+
+(define-map artist-booked-slots
+  { artist-id: uint, start-time: uint }
+  {
+    end-time: uint,
+    booking-id: uint
+  }
 )
 
 ;; public functions
@@ -173,10 +196,13 @@
       (total-amount (* (get rate-per-hour artist-data) duration))
       (escrow-amount (+ total-amount (/ (* total-amount (var-get platform-fee)) u1000)))
       (caller tx-sender)
+      (end-time (+ start-time duration))
     )
     (asserts! (get is-active artist-data) err-booking-not-active)
     (asserts! (> duration u0) err-invalid-amount)
     (asserts! (> start-time stacks-block-height) err-invalid-amount)
+    (asserts! (is-artist-available artist-id start-time end-time) err-artist-not-available)
+    (asserts! (not (has-booking-conflict artist-id start-time end-time)) err-time-slot-conflict)
     
     (try! (stx-transfer? escrow-amount caller (as-contract tx-sender)))
     
@@ -210,9 +236,17 @@
     (
       (booking-data (unwrap! (map-get? bookings { booking-id: booking-id }) err-not-found))
       (artist-data (unwrap! (map-get? artists { artist-id: (get artist-id booking-data) }) err-not-found))
+      (start-time (get start-time booking-data))
+      (end-time (+ start-time (get duration booking-data)))
+      (artist-id (get artist-id booking-data))
     )
     (asserts! (is-eq tx-sender (get owner artist-data)) err-unauthorized)
     (asserts! (is-eq (get status booking-data) "pending") err-booking-not-active)
+    
+    (map-set artist-booked-slots
+      { artist-id: artist-id, start-time: start-time }
+      { end-time: end-time, booking-id: booking-id }
+    )
     
     (map-set bookings
       { booking-id: booking-id }
@@ -252,6 +286,7 @@
       (merge artist-data { total-bookings: (+ (get total-bookings artist-data) u1) })
     )
     
+    (map-delete artist-booked-slots { artist-id: (get artist-id booking-data), start-time: (get start-time booking-data) })
     (map-delete escrow-funds { booking-id: booking-id })
     (ok true)
   )
@@ -262,11 +297,18 @@
     (
       (booking-data (unwrap! (map-get? bookings { booking-id: booking-id }) err-not-found))
       (escrow-data (unwrap! (map-get? escrow-funds { booking-id: booking-id }) err-not-found))
+      (artist-id (get artist-id booking-data))
+      (start-time (get start-time booking-data))
     )
     (asserts! (is-eq tx-sender (get client booking-data)) err-unauthorized)
     (asserts! (is-eq (get status booking-data) "pending") err-booking-not-active)
     
     (try! (as-contract (stx-transfer? (get amount escrow-data) tx-sender (get client booking-data))))
+    
+    (if (is-eq (get status booking-data) "accepted")
+      (map-delete artist-booked-slots { artist-id: artist-id, start-time: start-time })
+      true
+    )
     
     (map-set bookings
       { booking-id: booking-id }
@@ -386,6 +428,63 @@
   )
 )
 
+(define-public (set-availability (start-time uint) (end-time uint) (is-available bool))
+  (let
+    (
+      (artist-record (unwrap! (map-get? artist-by-owner { owner: tx-sender }) err-not-found))
+      (artist-id (get artist-id artist-record))
+      (availability-id (var-get next-availability-id))
+    )
+    (asserts! (> end-time start-time) err-invalid-time-slot)
+    (asserts! (> start-time stacks-block-height) err-invalid-time-slot)
+    
+    (map-set availability-slots
+      { availability-id: availability-id }
+      {
+        artist-id: artist-id,
+        start-time: start-time,
+        end-time: end-time,
+        is-available: is-available,
+        created-at: stacks-block-height
+      }
+    )
+    
+    (var-set next-availability-id (+ availability-id u1))
+    (ok availability-id)
+  )
+)
+
+(define-public (update-availability (availability-id uint) (is-available bool))
+  (let
+    (
+      (availability-data (unwrap! (map-get? availability-slots { availability-id: availability-id }) err-not-found))
+      (artist-record (unwrap! (map-get? artist-by-owner { owner: tx-sender }) err-not-found))
+      (artist-id (get artist-id artist-record))
+    )
+    (asserts! (is-eq (get artist-id availability-data) artist-id) err-unauthorized)
+    
+    (map-set availability-slots
+      { availability-id: availability-id }
+      (merge availability-data { is-available: is-available })
+    )
+    (ok true)
+  )
+)
+
+(define-public (remove-availability (availability-id uint))
+  (let
+    (
+      (availability-data (unwrap! (map-get? availability-slots { availability-id: availability-id }) err-not-found))
+      (artist-record (unwrap! (map-get? artist-by-owner { owner: tx-sender }) err-not-found))
+      (artist-id (get artist-id artist-record))
+    )
+    (asserts! (is-eq (get artist-id availability-data) artist-id) err-unauthorized)
+    
+    (map-delete availability-slots { availability-id: availability-id })
+    (ok true)
+  )
+)
+
 ;; read only functions
 (define-read-only (get-artist (artist-id uint))
   (map-get? artists { artist-id: artist-id })
@@ -436,4 +535,57 @@
 
 (define-read-only (get-next-portfolio-id)
   (var-get next-portfolio-id)
+)
+
+(define-read-only (is-artist-available (artist-id uint) (start-time uint) (end-time uint))
+  true
+)
+
+(define-read-only (has-booking-conflict (artist-id uint) (start-time uint) (end-time uint))
+  (is-some (map-get? artist-booked-slots { artist-id: artist-id, start-time: start-time }))
+)
+
+(define-read-only (get-availability-slot (availability-id uint))
+  (map-get? availability-slots { availability-id: availability-id })
+)
+
+(define-read-only (get-artist-booked-slot (artist-id uint) (start-time uint))
+  (map-get? artist-booked-slots { artist-id: artist-id, start-time: start-time })
+)
+
+(define-read-only (get-next-availability-id)
+  (var-get next-availability-id)
+)
+
+(define-read-only (check-booking-availability (artist-id uint) (start-time uint) (duration uint))
+  (let
+    (
+      (end-time (+ start-time duration))
+      (is-available (is-artist-available artist-id start-time end-time))
+      (has-conflict (has-booking-conflict artist-id start-time end-time))
+    )
+    {
+      is-available: is-available,
+      has-conflict: has-conflict,
+      can-book: (and is-available (not has-conflict)),
+      start-time: start-time,
+      end-time: end-time
+    }
+  )
+)
+
+(define-read-only (get-artist-schedule-status (artist-id uint) (start-time uint) (end-time uint))
+  (let
+    (
+      (availability-check (is-artist-available artist-id start-time end-time))
+      (conflict-check (has-booking-conflict artist-id start-time end-time))
+    )
+    {
+      artist-id: artist-id,
+      time-slot: { start: start-time, end: end-time },
+      is-available: availability-check,
+      has-booking-conflict: conflict-check,
+      can-accept-booking: (and availability-check (not conflict-check))
+    }
+  )
 )
