@@ -20,6 +20,9 @@
 (define-constant err-time-slot-conflict (err u112))
 (define-constant err-invalid-time-slot (err u113))
 (define-constant err-artist-not-available (err u114))
+(define-constant err-invalid-tier (err u115))
+(define-constant err-already-subscribed (err u116))
+(define-constant err-not-subscribed (err u117))
 
 ;; data vars
 (define-data-var next-artist-id uint u1)
@@ -28,6 +31,13 @@
 (define-data-var next-portfolio-id uint u1)
 (define-data-var max-portfolio-items uint u10)
 (define-data-var next-availability-id uint u1)
+(define-data-var next-subscription-id uint u1)
+(define-data-var bronze-tier-discount uint u50)
+(define-data-var silver-tier-discount uint u100)
+(define-data-var gold-tier-discount uint u150)
+(define-data-var bronze-tier-price uint u1000000)
+(define-data-var silver-tier-price uint u2500000)
+(define-data-var gold-tier-price uint u5000000)
 
 ;; data maps
 (define-map artists
@@ -113,6 +123,27 @@
   {
     end-time: uint,
     booking-id: uint
+  }
+)
+
+(define-map artist-subscriptions
+  { subscription-id: uint }
+  {
+    artist-id: uint,
+    subscriber: principal,
+    tier: uint,
+    start-block: uint,
+    end-block: uint,
+    is-active: bool
+  }
+)
+
+(define-map active-subscriber-status
+  { artist-id: uint, subscriber: principal }
+  {
+    subscription-id: uint,
+    tier: uint,
+    is-active: bool
   }
 )
 
@@ -485,6 +516,98 @@
   )
 )
 
+(define-public (subscribe-to-artist (artist-id uint) (tier uint) (duration uint))
+  (let
+    (
+      (subscription-id (var-get next-subscription-id))
+      (caller tx-sender)
+      (tier-price (get-tier-price tier))
+      (start-block stacks-block-height)
+      (end-block (+ start-block duration))
+    )
+    (asserts! (is-some (map-get? artists { artist-id: artist-id })) err-not-found)
+    (asserts! (or (is-eq tier u1) (or (is-eq tier u2) (is-eq tier u3))) err-invalid-tier)
+    (asserts! (is-none (map-get? active-subscriber-status { artist-id: artist-id, subscriber: caller })) err-already-subscribed)
+    (asserts! (> duration u0) err-invalid-amount)
+    
+    (try! (stx-transfer? tier-price caller (as-contract tx-sender)))
+    
+    (map-set artist-subscriptions
+      { subscription-id: subscription-id }
+      {
+        artist-id: artist-id,
+        subscriber: caller,
+        tier: tier,
+        start-block: start-block,
+        end-block: end-block,
+        is-active: true
+      }
+    )
+    
+    (map-set active-subscriber-status
+      { artist-id: artist-id, subscriber: caller }
+      {
+        subscription-id: subscription-id,
+        tier: tier,
+        is-active: true
+      }
+    )
+    
+    (var-set next-subscription-id (+ subscription-id u1))
+    (ok subscription-id)
+  )
+)
+
+(define-public (unsubscribe-from-artist (artist-id uint))
+  (let
+    (
+      (caller tx-sender)
+      (subscription-status (unwrap! (map-get? active-subscriber-status { artist-id: artist-id, subscriber: caller }) err-not-subscribed))
+      (subscription-id (get subscription-id subscription-status))
+      (subscription-data (unwrap! (map-get? artist-subscriptions { subscription-id: subscription-id }) err-not-found))
+    )
+    (asserts! (get is-active subscription-status) err-not-subscribed)
+    
+    (map-set artist-subscriptions
+      { subscription-id: subscription-id }
+      (merge subscription-data { is-active: false })
+    )
+    
+    (map-set active-subscriber-status
+      { artist-id: artist-id, subscriber: caller }
+      (merge subscription-status { is-active: false })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (renew-subscription (artist-id uint) (additional-duration uint))
+  (let
+    (
+      (caller tx-sender)
+      (subscription-status (unwrap! (map-get? active-subscriber-status { artist-id: artist-id, subscriber: caller }) err-not-subscribed))
+      (subscription-id (get subscription-id subscription-status))
+      (subscription-data (unwrap! (map-get? artist-subscriptions { subscription-id: subscription-id }) err-not-found))
+      (tier (get tier subscription-data))
+      (tier-price (get-tier-price tier))
+      (current-end-block (get end-block subscription-data))
+      (new-end-block (+ current-end-block additional-duration))
+    )
+    (asserts! (get is-active subscription-status) err-not-subscribed)
+    (asserts! (> additional-duration u0) err-invalid-amount)
+    
+    (try! (stx-transfer? tier-price caller (as-contract tx-sender)))
+    
+    (map-set artist-subscriptions
+      { subscription-id: subscription-id }
+      (merge subscription-data { end-block: new-end-block })
+    )
+    
+    (ok true)
+  )
+)
+
 ;; read only functions
 (define-read-only (get-artist (artist-id uint))
   (map-get? artists { artist-id: artist-id })
@@ -588,4 +711,61 @@
       can-accept-booking: (and availability-check (not conflict-check))
     }
   )
+)
+
+(define-read-only (get-tier-price (tier uint))
+  (if (is-eq tier u1)
+    (var-get bronze-tier-price)
+    (if (is-eq tier u2)
+      (var-get silver-tier-price)
+      (var-get gold-tier-price)
+    )
+  )
+)
+
+(define-read-only (get-tier-discount (tier uint))
+  (if (is-eq tier u1)
+    (var-get bronze-tier-discount)
+    (if (is-eq tier u2)
+      (var-get silver-tier-discount)
+      (var-get gold-tier-discount)
+    )
+  )
+)
+
+(define-read-only (get-subscription (subscription-id uint))
+  (map-get? artist-subscriptions { subscription-id: subscription-id })
+)
+
+(define-read-only (get-subscriber-status (artist-id uint) (subscriber principal))
+  (map-get? active-subscriber-status { artist-id: artist-id, subscriber: subscriber })
+)
+
+(define-read-only (is-active-subscriber (artist-id uint) (subscriber principal))
+  (match (map-get? active-subscriber-status { artist-id: artist-id, subscriber: subscriber })
+    status (get is-active status)
+    false
+  )
+)
+
+(define-read-only (calculate-discounted-rate (artist-id uint) (subscriber principal) (base-rate uint))
+  (match (map-get? active-subscriber-status { artist-id: artist-id, subscriber: subscriber })
+    status
+      (if (get is-active status)
+        (let
+          (
+            (tier (get tier status))
+            (discount (get-tier-discount tier))
+            (discount-amount (/ (* base-rate discount) u1000))
+          )
+          (- base-rate discount-amount)
+        )
+        base-rate
+      )
+    base-rate
+  )
+)
+
+(define-read-only (get-next-subscription-id)
+  (var-get next-subscription-id)
 )
