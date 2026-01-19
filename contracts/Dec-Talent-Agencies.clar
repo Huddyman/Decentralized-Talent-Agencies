@@ -23,6 +23,8 @@
 (define-constant err-invalid-tier (err u115))
 (define-constant err-already-subscribed (err u116))
 (define-constant err-not-subscribed (err u117))
+(define-constant err-tip-not-allowed (err u118))
+(define-constant err-tip-already-sent (err u119))
 
 ;; data vars
 (define-data-var next-artist-id uint u1)
@@ -38,6 +40,8 @@
 (define-data-var bronze-tier-price uint u1000000)
 (define-data-var silver-tier-price uint u2500000)
 (define-data-var gold-tier-price uint u5000000)
+(define-data-var next-tip-id uint u1)
+(define-data-var total-tips-collected uint u0)
 
 ;; data maps
 (define-map artists
@@ -145,6 +149,28 @@
     tier: uint,
     is-active: bool
   }
+)
+
+(define-map tips
+  { tip-id: uint }
+  {
+    booking-id: uint,
+    artist-id: uint,
+    tipper: principal,
+    amount: uint,
+    message: (string-ascii 128),
+    created-at: uint
+  }
+)
+
+(define-map booking-tips
+  { booking-id: uint }
+  { tip-id: uint }
+)
+
+(define-map artist-total-tips
+  { artist-id: uint }
+  { total-amount: uint, tip-count: uint }
 )
 
 ;; public functions
@@ -608,6 +634,54 @@
   )
 )
 
+(define-public (send-tip (booking-id uint) (amount uint) (message (string-ascii 128)))
+  (let
+    (
+      (booking-data (unwrap! (map-get? bookings { booking-id: booking-id }) err-not-found))
+      (artist-data (unwrap! (map-get? artists { artist-id: (get artist-id booking-data) }) err-not-found))
+      (artist-id (get artist-id booking-data))
+      (tip-id (var-get next-tip-id))
+      (caller tx-sender)
+      (current-artist-tips (default-to { total-amount: u0, tip-count: u0 } (map-get? artist-total-tips { artist-id: artist-id })))
+    )
+    (asserts! (is-eq caller (get client booking-data)) err-unauthorized)
+    (asserts! (is-eq (get status booking-data) "completed") err-tip-not-allowed)
+    (asserts! (> amount u0) err-invalid-amount)
+    (asserts! (is-none (map-get? booking-tips { booking-id: booking-id })) err-tip-already-sent)
+    
+    (try! (stx-transfer? amount caller (get owner artist-data)))
+    
+    (map-set tips
+      { tip-id: tip-id }
+      {
+        booking-id: booking-id,
+        artist-id: artist-id,
+        tipper: caller,
+        amount: amount,
+        message: message,
+        created-at: stacks-block-height
+      }
+    )
+    
+    (map-set booking-tips
+      { booking-id: booking-id }
+      { tip-id: tip-id }
+    )
+    
+    (map-set artist-total-tips
+      { artist-id: artist-id }
+      {
+        total-amount: (+ (get total-amount current-artist-tips) amount),
+        tip-count: (+ (get tip-count current-artist-tips) u1)
+      }
+    )
+    
+    (var-set total-tips-collected (+ (var-get total-tips-collected) amount))
+    (var-set next-tip-id (+ tip-id u1))
+    (ok tip-id)
+  )
+)
+
 ;; read only functions
 (define-read-only (get-artist (artist-id uint))
   (map-get? artists { artist-id: artist-id })
@@ -768,4 +842,27 @@
 
 (define-read-only (get-next-subscription-id)
   (var-get next-subscription-id)
+)
+
+(define-read-only (get-tip (tip-id uint))
+  (map-get? tips { tip-id: tip-id })
+)
+
+(define-read-only (get-booking-tip (booking-id uint))
+  (match (map-get? booking-tips { booking-id: booking-id })
+    tip-record (map-get? tips { tip-id: (get tip-id tip-record) })
+    none
+  )
+)
+
+(define-read-only (get-artist-tips-summary (artist-id uint))
+  (default-to { total-amount: u0, tip-count: u0 } (map-get? artist-total-tips { artist-id: artist-id }))
+)
+
+(define-read-only (get-total-tips-collected)
+  (var-get total-tips-collected)
+)
+
+(define-read-only (get-next-tip-id)
+  (var-get next-tip-id)
 )
